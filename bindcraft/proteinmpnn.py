@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from typing import Callable
 from jax import Array
+from bindcraft.accelerator import _oneapi_compiler_options
 from bindcraft.prediction import ProteinPredictor, CompiledModelCache, residue_chain_ids, concatenate_chain_arrays, split_residue_arrays_by_chain
 from bindcraft.model_weights import MPNN_WEIGHT_VARIANTS, mpnn_variant_directory
 from bindcraft.af2 import DEFAULT_LENGTH_BUCKET, padded_prediction_complex
@@ -107,7 +108,7 @@ class ProteinMPNNSequenceModel(ProteinPredictor):
                 sequence_recovery = (recovered_residue_mask * resolved_ca_mask).sum() / (resolved_ca_mask.sum() + 1e-08)
                 updated_sequence = jax.nn.one_hot(selected_amino_acids, 20).astype(jnp.float16)
                 return updated_sequence, sequence_negative_log_likelihood, sequence_recovery
-            compiled_sequence_prediction = jax.jit(jax.vmap(predict_mpnn_sequence, in_axes=(None, 0, None, None, None, None, None, None)))
+            compiled_sequence_prediction = jax.jit(jax.vmap(predict_mpnn_sequence, in_axes=(None, 0, None, None, None, None, None, None)), compiler_options=_oneapi_compiler_options())
             self.prediction_compile_cache.set(cache_key, compiled_sequence_prediction)
         return compiled_sequence_prediction
 

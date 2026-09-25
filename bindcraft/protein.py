@@ -15,6 +15,7 @@ from enum import IntFlag
 from itertools import accumulate
 from typing import Any, NamedTuple
 from jax import Array
+from bindcraft.accelerator import _oneapi_compiler_options, _oneapi_devices
 
 AMINO_ACIDS = 'ARNDCQEGHILKMFPSTWYV'
 AMINO_ACID_INDEX: dict[str, int] = {amino_acid: index for index, amino_acid in enumerate(AMINO_ACIDS)}
@@ -72,12 +73,28 @@ def has_resolved_atom(atom_mask: Array, name: str) -> Array:
 def alignment_matrix_product(left: Array, right: Array) -> Array:
     return jnp.matmul(left, right, precision=jax.lax.Precision.HIGHEST)
 
+# oneAPI lacks the eigh lowering used by JAX's SVD; Kabsch rotations do not carry gradients.
+@jax.custom_jvp
+def _oneapi_cpu_svd(matrix: Array) -> tuple[Array, Array, Array]:
+    result_shapes = (
+        jax.ShapeDtypeStruct(matrix.shape, matrix.dtype),
+        jax.ShapeDtypeStruct(matrix.shape[:-1], matrix.dtype),
+        jax.ShapeDtypeStruct(matrix.shape, matrix.dtype),
+    )
+    return jax.pure_callback(lambda value: _np.linalg.svd(value, full_matrices=True), result_shapes, matrix, vmap_method='sequential')
+
+@_oneapi_cpu_svd.defjvp
+def _oneapi_cpu_svd_jvp(primals, tangents):
+    (matrix,), _ = primals, tangents
+    result = _oneapi_cpu_svd(matrix)
+    return result, tuple(jnp.zeros_like(value) for value in result)
+
 def kabsch(coordinates: Array, reference_coordinates: Array, alignment_weights: Array) -> tuple[Array, Array, Array]:
     alignment_weight_sum = alignment_weights.sum() + 1e-08
     coordinate_center = (coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
     reference_center = (reference_coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
     alignment_covariance = jnp.where(alignment_weights.sum() > 0, alignment_matrix_product(((coordinates - coordinate_center) * alignment_weights[:, None]).T, reference_coordinates - reference_center), jnp.eye(3, dtype=coordinates.dtype))
-    left_vectors, _, right_vectors = jnp.linalg.svd(alignment_covariance)
+    left_vectors, _, right_vectors = _oneapi_cpu_svd(alignment_covariance) if _oneapi_devices() else jnp.linalg.svd(alignment_covariance)
     rotation_determinant = jnp.sign(jnp.linalg.det(alignment_matrix_product(right_vectors.T, left_vectors.T)))
     rotation = alignment_matrix_product(right_vectors.T * jnp.array([1.0, 1.0, rotation_determinant], dtype=coordinates.dtype), left_vectors.T)
     return rotation, coordinate_center, reference_center
@@ -143,7 +160,7 @@ def relax_energy(atoms: Array, geometry: dict) -> Array:
 def relax_protein_complex(protein_complex: dict[str, 'Protein'], parameters: dict | None=None) -> dict[str, 'Protein']:
     parameters = {**default_relax_parameters(), **(parameters or {})}
     geometry = relax_geometry(protein_complex, parameters)
-    energy_gradient = jax.jit(jax.grad(relax_energy))
+    energy_gradient = jax.jit(jax.grad(relax_energy), compiler_options=_oneapi_compiler_options())
     energy_terms = {term: geometry[term] for term in RELAX_ENERGY_TERMS}
     atoms = geometry['input_atoms']
     optimizer = optax.adam(parameters['learning_rate'])

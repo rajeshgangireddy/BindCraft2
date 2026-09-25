@@ -7,6 +7,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from jax import Array
+from bindcraft.accelerator import _oneapi_compiler_options, _oneapi_devices
 from bindcraft.af.alphafold.common import confidence, residue_constants
 from bindcraft.af.alphafold.model import config as af_config, data as af_data, model as af_model, modules as af_modules
 from bindcraft.af import accel
@@ -283,7 +284,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                 predicted_atom_positions = alphafold_outputs['structure_module']['final_atom_positions'].astype(jnp.float16)
                 predicted_atom_mask = alphafold_outputs['structure_module']['final_atom_mask'].astype(bool)
                 return predicted_atom_positions, predicted_atom_mask, alphafold_prediction_metrics(alphafold_outputs, seq_mask, interface_asym_id)
-            compiled_prediction = jax.jit(predict_complex_arrays)
+            compiled_prediction = jax.jit(predict_complex_arrays, compiler_options=_oneapi_compiler_options())
             self.prediction_compile_cache.set(cache_key, compiled_prediction)
         return compiled_prediction
 
@@ -318,6 +319,8 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             interface_asym_id = jnp.pad(interface_asym_id, [0, padding_length], constant_values=len(chain_names))
             seq_mask = jnp.pad(seq_mask, [0, padding_length])
         positions, mask, metrics = self._compiled_complex_prediction(model, padded_residue_count)(self.model_parameters[model], self.key, sequence, atoms, atom_mask, residue_index, asym_id, entity_id, interface_asym_id, seq_mask, flags, jnp.asarray(self.dropout), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale))
+        if _oneapi_devices():
+            jax.block_until_ready((positions, mask, metrics))
         positions, mask = positions[:residue_count], mask[:residue_count]
         metrics = {name: trim_prediction_padding(value, residue_count) for name, value in metrics.items()}
         positions = align_prediction_to_target_template(positions, mask, atoms[:residue_count], atom_mask[:residue_count], flags[:residue_count])
@@ -375,7 +378,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                             raise ValueError(f'loss {name!r} would overwrite an existing metric on {state_name!r}')
                         metrics[name] = weighted_losses[name]
                 return total_loss, prediction_arrays
-            compiled_gradient = jax.jit(jax.value_and_grad(sequence_design_loss, argnums=2, has_aux=True))
+            compiled_gradient = jax.jit(jax.value_and_grad(sequence_design_loss, argnums=2, has_aux=True), compiler_options=_oneapi_compiler_options())
             self.gradient_compile_cache.set(cache_key, compiled_gradient)
         return compiled_gradient
 

@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from bindcraft.accelerator import _oneapi_devices
 from bindcraft.af2 import campaign_length_bucket, padded_prediction_length
 from bindcraft.campaign_output import json_compatible
 from bindcraft.protein_preparation import design_residue_count
@@ -91,13 +92,29 @@ PACKED_LAUNCH_STAGGER_SECONDS = 0.0
 
 def campaign_subbatch_size(settings: dict, residue_count: int | None) -> int | None | str:
     requested = settings.get('subbatch_size', 'auto')
-    if requested != 'auto' or not residue_count:
+    if requested != 'auto' or not residue_count or _oneapi_devices():
         return requested
     free_gb = max((free for free, _ in design_gpu_memory_gb().values()), default=0.0)
     return None if free_gb and estimate_design_memory_gb(residue_count) <= SUBBATCH_MEMORY_SHARE * free_gb else requested
 
 def design_worker_launch_stagger(settings: dict) -> float:
     return float(os.environ.get('BINDCRAFT_WORKER_LAUNCH_STAGGER', settings.get('worker_launch_stagger', PACKED_LAUNCH_STAGGER_SECONDS)))
+
+def _validate_oneapi_worker_settings(settings: dict) -> None:
+    if settings.get('attention_backend') == 'cudnn':
+        raise ValueError('attention_backend=cudnn requires CUDA; use "auto" or "stock" with oneAPI')
+    if settings.get('use_cueq'):
+        raise ValueError('use_cueq requires CUDA cuEquivariance kernels and is not supported with oneAPI')
+    gpu_ids = os.environ.get('BINDCRAFT_GPU_IDS', settings.get('gpu_ids'))
+    if gpu_ids not in (None, '') and (not isinstance(gpu_ids, str) or gpu_ids.strip().lower() != 'all'):
+        raise ValueError('gpu_ids and BINDCRAFT_GPU_IDS select NVIDIA cards and cannot be used with oneAPI; unset them or use "all"')
+    requested_workers = os.environ.get('BINDCRAFT_WORKERS_PER_GPU', settings.get('workers_per_gpu', 'auto'))
+    requested_workers = 'auto' if requested_workers is None else str(requested_workers).lower()
+    if requested_workers != 'auto' and int(requested_workers) > 1:
+        raise ValueError('only one design worker per Intel XPU is supported')
+    worker_limit = int(os.environ.get('BINDCRAFT_DESIGN_WORKERS', settings.get('design_workers') or 0))
+    if worker_limit > 1:
+        raise ValueError('multiple design workers are not supported on oneAPI')
 
 def campaign_length_buckets(settings: dict) -> tuple[tuple[int, ...], ...]:
     design_settings = build_design_settings(settings)
@@ -236,6 +253,12 @@ def launch_design_workers(plan: list[dict], log_directory: str, worker_command: 
             log_file.close()
 
 def dispatch_design_workers(settings: dict, log_directory: str, residue_count: int | None=None, worker_command: list[str] | None=None, project_folders: tuple[str, ...]=(), worker_arguments: tuple[str, ...]=(), trajectory_budget: int | None=None) -> int | None:
+    oneapi_devices = _oneapi_devices()
+    if oneapi_devices:
+        if len(oneapi_devices) > 1:
+            raise ValueError(f'BindCraft supports one Intel XPU, but JAX exposes {len(oneapi_devices)}')
+        _validate_oneapi_worker_settings(settings)
+        return None
     if running_as_design_worker() or not settings.get('auto_multi_gpu', True):
         return None
     plan = plan_design_workers(settings, residue_count, trajectory_budget)

@@ -153,6 +153,10 @@ def split_metadata_file(arguments: list[str]) -> tuple[list[str], str | None]:
     return paths, '' if named else metadata_path
 
 def design_card_name() -> str | None:
+    from bindcraft.accelerator import _oneapi_devices
+    oneapi_devices = _oneapi_devices()
+    if oneapi_devices:
+        return oneapi_devices[0].device_kind
     try:
         listing = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):

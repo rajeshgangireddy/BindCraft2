@@ -13,11 +13,16 @@ fetch_weights=1
 for argument in "$@"; do
   case "$argument" in
     --no-weights) fetch_weights=0 ;;
-    cuda13|cuda12|rocm) accelerator="$argument" ;;
+    cuda13|cuda12|rocm|oneapi) accelerator="$argument" ;;
     cpu) echo "bindcraft: there is no CPU installation. A trajectory folds an AlphaFold ensemble hundreds of times, which is days of processor for an hour of card, so install where there is a GPU." >&2; exit 2 ;;
     *) echo "usage: bash install.sh [cuda13|cuda12|rocm|oneapi] [--no-weights]" >&2; exit 2 ;;
   esac
 done
+
+if [[ $accelerator == oneapi && ( $(uname -s) != Linux || $(uname -m) != x86_64 ) ]]; then
+  echo "bindcraft: the oneAPI JAX wheels require Linux x86_64" >&2
+  exit 2
+fi
 
 if [[ -z $accelerator ]]; then
   # nvidia-smi reports the newest CUDA its driver serves, which is what the jax wheels are built for.
@@ -104,18 +109,78 @@ build_environment() {
 # before, or a new one under ./.venv built by whichever of uv, venv and conda this machine has.
 python="${BINDCRAFT_PYTHON:-}"
 builder=""
+managed_venv=0
 if [[ -z $python && -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]]; then python=$(command -v python3 || true); fi
-if [[ -z $python && -x .venv/bin/python ]]; then python="$PWD/.venv/bin/python"; fi
+if [[ -z $python && -x .venv/bin/python ]]; then python="$PWD/.venv/bin/python"; managed_venv=1; fi
 if [[ -z $python ]]; then
   echo "bindcraft: no environment active, building one in ./.venv"
   build_environment || { echo "bindcraft: could not build an environment here with uv, venv or conda" >&2; exit 1; }
   echo "bindcraft: environment built by $builder"
   python="$PWD/.venv/bin/python"
+  managed_venv=1
 fi
 "$python" -c 'import sys; raise SystemExit(sys.version_info < (3, 12))' || {
   echo "bindcraft: $("$python" -c 'import sys; print(sys.version.split()[0])') is active and BC2 needs $PYTHON_MINIMUM or newer; deactivate it and run this again to build an environment here" >&2
   exit 1
 }
+python_prefix=$("$python" -c 'import sys; print(sys.prefix)')
+if [[ $python_prefix == "$PWD/.venv" ]]; then managed_venv=1; fi
+
+if [[ $managed_venv == 1 ]]; then
+  "$python" - "$PWD/.venv/bin/activate" "$accelerator" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_file() and sys.argv[2] == 'oneapi':
+    raise SystemExit(f'bindcraft: cannot find {path} to configure the oneAPI runtime path')
+if not path.is_file():
+    raise SystemExit(0)
+text = path.read_text()
+activation_marker = '# bindcraft oneAPI runtime'
+restore_marker = '    # bindcraft restore oneAPI runtime path'
+activation = '''# bindcraft oneAPI runtime
+_BINDCRAFT_OLD_LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}
+if [ "${LD_LIBRARY_PATH+x}" ]; then
+    _BINDCRAFT_OLD_LD_LIBRARY_PATH_SET=1
+else
+    _BINDCRAFT_OLD_LD_LIBRARY_PATH_SET=0
+fi
+export _BINDCRAFT_OLD_LD_LIBRARY_PATH _BINDCRAFT_OLD_LD_LIBRARY_PATH_SET
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+'''
+restore = '''    # bindcraft restore oneAPI runtime path
+    if [ -n "${_BINDCRAFT_OLD_LD_LIBRARY_PATH_SET+x}" ]; then
+        if [ "$_BINDCRAFT_OLD_LD_LIBRARY_PATH_SET" = "1" ]; then
+            export LD_LIBRARY_PATH="$_BINDCRAFT_OLD_LD_LIBRARY_PATH"
+        else
+            unset LD_LIBRARY_PATH
+        fi
+        unset _BINDCRAFT_OLD_LD_LIBRARY_PATH _BINDCRAFT_OLD_LD_LIBRARY_PATH_SET
+    fi
+'''
+deactivation_point = '    unset VIRTUAL_ENV\n'
+if sys.argv[2] == 'oneapi':
+    if activation_marker in text or restore_marker in text:
+        if activation not in text or restore not in text:
+            raise SystemExit('bindcraft: .venv activation has an incomplete oneAPI runtime hook')
+    else:
+        if text.count(deactivation_point) != 1:
+            raise SystemExit(f'bindcraft: cannot configure the oneAPI runtime path in {path}')
+        text = text.replace(deactivation_point, restore + deactivation_point, 1)
+        text = text.rstrip() + '\n\n' + activation
+elif activation_marker in text or restore_marker in text:
+    if activation not in text or restore not in text:
+        raise SystemExit('bindcraft: .venv activation has an incomplete oneAPI runtime hook')
+    text = text.replace(restore + deactivation_point, deactivation_point, 1)
+    text = text.removesuffix(activation)
+path.write_text(text)
+PY
+fi
+if [[ $accelerator == oneapi ]]; then
+  oneapi_library_path="$python_prefix/lib"
+  export LD_LIBRARY_PATH="$oneapi_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 echo "bindcraft: installing for $accelerator"
 "$python" -m pip install --quiet --upgrade pip
@@ -133,10 +198,13 @@ if ! "$python" -m bindcraft.selfcheck "$accelerator"; then
 fi
 # Whether it also runs here is a different question: a login node with tight process limits cannot
 # start a JAX runtime while its compute nodes are fine, so this reports rather than refuses.
-if backend=$("$python" -c 'import jax; print(jax.default_backend(), len(jax.devices()))' 2>/dev/null); then
+if backend=$("$python" -c 'import jax; devices=jax.devices(); print("oneapi" if any(device.platform == "oneapi" for device in devices) else jax.default_backend(), len(devices))' 2>/dev/null); then
   echo "bindcraft: jax runs here on ${backend% *}, ${backend#* } device(s)"
   if [[ $accelerator == cuda* && ${backend% *} == cpu && -n $(nvidia-smi -L 2>/dev/null) ]]; then
     echo "bindcraft: this machine has a GPU and jax did not take it, so a campaign here would run on the CPU" >&2
+  fi
+  if [[ $accelerator == oneapi && ${backend% *} != oneapi ]]; then
+    echo "bindcraft: no oneAPI device is visible here; a campaign will refuse CPU fallback" >&2
   fi
 else
   echo "bindcraft: jax did not start here, which is normal on a login node; check inside your allocation with"
@@ -144,5 +212,16 @@ else
 fi
 echo
 echo "bindcraft: installed, designing on $accelerator."
+if [[ $accelerator == oneapi ]]; then
+  if [[ $managed_venv == 1 ]]; then
+    echo "  .venv/bin/activate adds $python_prefix/lib to LD_LIBRARY_PATH"
+    if [[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]]; then
+      echo "  source .venv/bin/activate            # apply it to this terminal"
+    fi
+  else
+    echo "  add the oneAPI runtime libraries in each terminal with:"
+    printf '  export LD_LIBRARY_PATH=%q${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' "$oneapi_library_path"
+  fi
+fi
 [[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]] || echo "  source .venv/bin/activate            # once per terminal"
 echo "  bindcraft design examples/pdl1_denovo.json"

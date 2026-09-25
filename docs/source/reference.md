@@ -485,6 +485,8 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 
 Worker packing is limited by GPU memory, host memory and the campaign's attempt budget; sweep fan-out uses the budget of one arm. A trajectory-only run uses one worker per GPU. Lengths can be divided among workers, so faster length groups can appear more often in results. See [execution and environment overrides](installation.md#gpu-and-memory-controls) for scheduling, caches and GPU visibility.
 
+On Intel oneAPI, campaigns use one XPU in one process. Explicit NVIDIA GPU IDs and multi-worker packing are unsupported; cuDNN and cuEquivariance require CUDA.
+
 ## Installation
 
 Use the [installation and running guide](installation.md) for local environments, Slurm, containers, offline nodes and troubleshooting.

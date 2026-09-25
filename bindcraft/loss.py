@@ -1,11 +1,13 @@
 import functools
 import inspect
+import math
 import random
 import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import block_diag
 from typing import Callable, NamedTuple
 from jax import Array
+from bindcraft.accelerator import _oneapi_devices, _oneapi_smallest_indices
 from bindcraft.developability import EPITOPE_CORE_LENGTH, HYDROPHOBICITY, MHCPanel, mhc_panels, protease_panel
 from bindcraft.protein import AMINO_ACIDS, ATOM_INDEX, BINDER_ALONE, Protein, ProteinStates, ResidueFlags, StructurePredictions, alignment_matrix_product, has_residue_flag, kabsch, real_residue_count, real_residue_mask, real_residue_weights, redesignable_residue_mask
 
@@ -408,7 +410,21 @@ def target_rigidity_loss(protein_states: ProteinStates, predictions: StructurePr
     chain_index = receptor_chain_index(template)
     return template_distance_deviation(template, predictions[prediction_state].protein_complex[target], (chain_index[:, None] != chain_index[None, :]).astype(jnp.float32))
 
+def _oneapi_best_contact_mean(values: Array, contact_count: int | float, mask: Array, eps: float) -> Array:
+    residue_count = values.shape[-1]
+    if math.isnan(contact_count) or contact_count <= 0:
+        return jnp.zeros(values.shape[:-1], dtype=values.dtype)
+    if contact_count >= residue_count:
+        selected_values = jnp.where(mask, values, 0)
+        return selected_values.sum(-1) / (mask.sum(-1) + eps)
+    contact_ranking = _oneapi_smallest_indices(jnp.where(mask, values, jnp.inf), math.ceil(contact_count))
+    ranked_values = jnp.take_along_axis(values, contact_ranking, axis=-1)
+    selected = jnp.take_along_axis(mask, contact_ranking, axis=-1)
+    return jnp.where(selected, ranked_values, 0).sum(-1) / (selected.sum(-1) + eps)
+
 def best_contact_mean(values: Array, contact_count: int | float, mask: Array, eps: float=0.0001) -> Array:
+    if _oneapi_devices():
+        return _oneapi_best_contact_mean(values, contact_count, mask, eps)
     contact_ranking = jax.lax.stop_gradient(jnp.argsort(jnp.where(mask, values, jnp.inf)))
     ranked_values = jnp.take_along_axis(values, contact_ranking, axis=-1)
     selected = (jnp.arange(values.shape[-1]) < contact_count) & jnp.take_along_axis(mask, contact_ranking, axis=-1)

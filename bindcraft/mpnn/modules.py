@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from bindcraft.accelerator import _oneapi_devices, _oneapi_smallest_indices
 from .utils import cat_neighbors_nodes, get_ar_mask
 from .sample import mpnn_sample
 from .score import mpnn_score
@@ -197,6 +198,8 @@ class ProteinFeatures(hk.Module):
     D = jnp.sqrt(jnp.square(dX).sum(-1) + eps)
     D_masked = jnp.where(mask_2D,D,D.max(-1,keepdims=True))
     k = min(self.top_k, X.shape[-2])
+    if _oneapi_devices():
+      return _oneapi_smallest_indices(D_masked, k)
     return jax.lax.approx_min_k(D_masked, k, reduction_dimension=-1)[1]
 
   def _rbf(self, D):

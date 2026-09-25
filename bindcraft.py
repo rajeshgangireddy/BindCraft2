@@ -60,6 +60,10 @@ def designs_a_campaign(arguments: list[str]) -> bool:
     return named == 'design' or (bool(named) and named not in COMMANDS and named not in COMMAND_MODULES and named not in package_modules() and (not named.startswith('-')))
 
 def design_gpu_note() -> str:
+    from bindcraft.accelerator import _oneapi_devices
+    oneapi_devices = _oneapi_devices()
+    if oneapi_devices:
+        return f'{len(oneapi_devices)} Intel XPUs visible; only one is supported' if len(oneapi_devices) > 1 else '1 Intel XPU visible, designing on it'
     from bindcraft.design_workers import visible_design_gpus
     gpus = visible_design_gpus()
     if len(gpus) > 1:

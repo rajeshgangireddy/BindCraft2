@@ -21,6 +21,8 @@ bash install.sh
 source .venv/bin/activate
 ```
 
+For an Intel XPU on Linux x86_64, install explicitly with `bash install.sh oneapi`. This experimental path runs one XPU per campaign; see the [installation guide](docs/source/installation.md#intel-xpu).
+
 In a new terminal, return to `BindCraft2` and run `source .venv/bin/activate` again. See the [installation and running guide](docs/source/installation.md) for existing environments, older GPUs, clusters, containers and troubleshooting.
 
 ## Run your first design

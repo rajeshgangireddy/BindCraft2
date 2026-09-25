@@ -4,7 +4,7 @@ First design (see "Run your first design" in your BindCraft2 repo's top-level RE
 
 [Install](#install) · [Check it](#check-the-installation) · [Weights and caches](#model-weights-and-caches) · [Run a campaign](#run-a-campaign) · [GPU and memory](#gpu-and-memory-controls) · [Clusters](#slurm-and-other-schedulers) · [Containers](#containers) · [No internet](#machines-with-no-route-to-the-internet) · [Troubleshooting](#troubleshooting)
 
-BindCraft2 needs Linux, Python 3.12 or newer and a GPU. One command installs it on a workstation, a login node or inside a container, and chooses the accelerator wheels for the card it finds. **There is no CPU installation**: a single trajectory folds an AlphaFold ensemble hundreds of times, which is days of processor for an hour of card, so `bash install.sh cpu` is refused rather than quietly built.
+BindCraft2 needs Linux, Python 3.12 or newer and a GPU. `bash install.sh` selects NVIDIA CUDA from the driver; Intel XPU is an explicit, experimental install on Linux x86_64. **There is no CPU installation**: a single trajectory folds an AlphaFold ensemble hundreds of times, which is days of processor for an hour of card, so `bash install.sh cpu` is refused rather than quietly built.
 
 ## Install
 
@@ -25,6 +25,7 @@ source .venv/bin/activate
 | Cluster login node with no visible GPU | `bash install.sh`, which assumes CUDA 13 for the card your job will get |
 | Compute nodes with V100 or older cards | `bash install.sh cuda12` from the login node |
 | AMD | `bash install.sh rocm` |
+| Intel XPU (Linux x86_64; experimental) | `bash install.sh oneapi` |
 | A Conda or virtual environment you want to keep using | activate it first, then `bash install.sh` |
 | No route to the internet from the compute nodes | `bash install.sh`, then see [machines with no route to the internet](#machines-with-no-route-to-the-internet) |
 | No usable Python at all | `bash install.sh`, which fetches `uv` and brings its own interpreter |
@@ -37,11 +38,28 @@ source .venv/bin/activate
 | `cuda13` | CUDA 13 wheels; needs compute capability 7.5 or newer. |
 | `cuda12` | CUDA 12 wheels; the choice for Volta, Pascal and Maxwell cards. |
 | `rocm` | AMD accelerators, against a local ROCm 7 installation. |
+| `oneapi` | Prerelease Intel JAX plugin for one XPU; Linux x86_64 only. |
 | `--no-weights` | Skip the one-time AlphaFold download; run `bindcraft fetch-weights` later. |
 
 Automatic selection reads the CUDA version `nvidia-smi` reports, then the oldest visible card's compute capability. A driver serving CUDA 13 or 14 selects `cuda13`, a driver serving 12 selects `cuda12`, and a card below compute capability 7.5 moves the choice back to `cuda12` however new the driver is. **A machine with no driver selects `cuda13` and says so**, which is the ordinary case on a login node where the card belongs to the job rather than to the machine doing the installing. It never falls back to CPU wheels. A driver older than CUDA 12 reads the same way and prints the same line, because only 12, 13 and 14 are matched, so name `cuda12` yourself on such a machine.
 
 Match the choice to the **compute** nodes, not the login node. If they differ, name the accelerator explicitly.
+
+### Intel XPU (experimental)
+
+```bash
+bash install.sh oneapi
+```
+
+This pins JAX/JAXLIB 0.11.1 with the prerelease `jax-oneapi-plugin` and `jax-oneapi-pjrt` 0.11.1.dev20260820. The stack has been tested locally on an Arc Pro B70; other XPU models are not verified. The installer adds the environment's `lib/` directory to `LD_LIBRARY_PATH` when it manages `.venv`. For an existing environment, it prints the export command to use in each terminal; without this path the plugin may not load.
+
+Check that JAX selected the Intel device:
+
+```bash
+python -c "import jax; devices=jax.devices(); print([(d.platform, d.device_kind) for d in devices]); assert any(d.platform == 'oneapi' for d in devices)"
+```
+
+`jax.default_backend()` reports the generic `gpu` platform for this plugin, so check `device.platform`. Campaigns use one XPU in one process. The tested path uses stock attention; cuDNN and cuEquivariance require CUDA.
 
 ### Installing into an environment you already have
 
@@ -76,11 +94,12 @@ Run this inside a GPU allocation, or on the workstation, to confirm the cards ar
 python -c "import jax; print(jax.devices()); assert jax.default_backend() == 'gpu', 'no GPU available to JAX'"
 ```
 
-One `CudaDevice` per card is the answer. `[CpuDevice(id=0)]` means a campaign here would run on the CPU. The installer flags this case itself when the machine has a GPU that JAX did not take.
+`CudaDevice`s identify CUDA cards; the Intel plugin reports devices with platform `oneapi`. `[CpuDevice(id=0)]` means JAX fell back to the CPU. The installer flags this case when it can identify an accelerator that JAX did not take.
 
 ```bash
 python -m bindcraft.selfcheck cuda13              # after changing an environment by hand
 python -m bindcraft.selfcheck cuda13 --shipped-only   # ask only about the checkpoints the package carries
+python -m bindcraft.selfcheck oneapi              # Intel XPU installation
 ```
 
 ## Model weights and caches
@@ -94,9 +113,9 @@ A campaign designs against five multimer models and holds two monomer models bac
 
 ### Compiled-graph caches
 
-A prediction shape costs about 60 s to compile and 1.5 s to read back, so a campaign keeps its compiled graphs between runs under `~/.cache/bindcraft/compile_cache/<card>`, filed by GPU type because an executable is not portable across cards. It prints `compiled graphs cached in <path>` when it does.
+A prediction shape costs about 60 s to compile and 1.5 s to read back, so a campaign keeps its compiled graphs between runs under `~/.cache/bindcraft/compile_cache/<card>`, filed by device type because an executable is not portable across cards. CUDA uses `nvidia-smi` to name the card; oneAPI uses the JAX device kind. It prints `compiled graphs cached in <path>` when it does.
 
-That per-card cache needs `nvidia-smi` to name the card. **Where `nvidia-smi` cannot be reached, including inside the shipped container image, which does not carry it, graphs go to `${TMPDIR:-/tmp}/bindcraft_xla_cache` instead** and no caching line is printed, so every campaign pays its compiles again. Set `JAX_COMPILATION_CACHE_DIR` to keep them somewhere durable, which is also worth doing on a cluster whose nodes all carry the same card. Where the home cache exists but cannot be written, the graphs go under the campaign's own output folder.
+If no device name is available, including inside the shipped container image without `nvidia-smi`, graphs go to `${TMPDIR:-/tmp}/bindcraft_xla_cache` and no caching line is printed, so every campaign pays its compiles again. Set `JAX_COMPILATION_CACHE_DIR` to keep them somewhere durable, which is also worth doing on a cluster whose nodes all carry the same card. Where the home cache exists but cannot be written, the graphs go under the campaign's own output folder.
 
 These are working files. Deleting them costs compile time and no results.
 
@@ -149,11 +168,11 @@ Exit status 0 is a finished campaign, 2 a refusal printed as `campaign refused:`
 
 ## GPU and memory controls
 
-A campaign uses **every GPU it can see, without being asked**, and packs several design workers onto each card. Nothing needs configuring for this; the settings to override this behaviour are indicated below.
+CUDA campaigns use **every visible NVIDIA GPU by default** and pack several design workers onto each card. Intel oneAPI uses one process on one XPU and does not probe NVIDIA memory.
 
 ### How a campaign fills a card
 
-Visible cards are read from `CUDA_VISIBLE_DEVICES`, and from `nvidia-smi` when that is unset. A whole-cycle campaign runs up to **seven workers per card**, as many as its free memory holds. On a GH200 a forty-trajectory campaign took 3620 s at one worker and 2021 s at seven.
+CUDA cards are read from `CUDA_VISIBLE_DEVICES`, and from `nvidia-smi` when that is unset. A whole-cycle campaign runs up to **seven workers per card**, as many as its free memory holds. On a GH200 a forty-trajectory campaign took 3620 s at one worker and 2021 s at seven.
 
 If `trajectory_only` is set in a campaign, or a card whose memory cannot be read, BindCraft2 runs **one worker per card**.
 
@@ -180,6 +199,8 @@ The first five carry an environment variable that takes precedence over the sett
 | `use_cueq` | — | false | Enable cuEquivariance kernels, which the CUDA extras install. |
 
 `BINDCRAFT_WORKER_ID`, `BINDCRAFT_WORKER_COUNT` and `BINDCRAFT_BINDER_LENGTHS` are set **for** each worker by the campaign. **Do not set them; a process that carries `BINDCRAFT_WORKER_ID` believes it is a worker and will not fan out.**
+
+On oneAPI, explicit NVIDIA `gpu_ids` selections and requests for more than one worker are refused. `attention_backend=cudnn` and `use_cueq=true` are CUDA-only.
 
 ### When a campaign runs out of GPU memory
 
@@ -305,6 +326,7 @@ The [trajectory viewer](outputs.md#trajectory-records-and-viewers) loads its 3Dm
 | A campaign runs, far slower than expected | JAX took the CPU. It warns once, inside a plugin traceback. | Run the device check above. In a container, see [reaching the cards](#reaching-the-cards-from-a-container); otherwise check the allocation asked for a GPU and that the accelerator matches the card. |
 | `jax did not start here` during installation | Login-node process limits, which do not apply on compute nodes. | Normal. Repeat the device check inside an allocation. |
 | `[CpuDevice(id=0)]` inside an allocation | No GPU in the allocation, a driver the wheels do not match, or a container with no driver injected. | `nvidia-smi` to confirm the card, then reinstall naming the accelerator, or set the two `NVIDIA_*` variables. |
+| oneAPI is selected but JAX reports only a CPU | The Intel runtime libraries were not found. | Activate the managed `.venv` or add the `lib/` path printed by `install.sh oneapi` to `LD_LIBRARY_PATH`; check for `device.platform == "oneapi"`. |
 | Works on the login node, fails on compute nodes | The installer read the login node's driver, and the compute cards are older. | `bash install.sh cuda12`. |
 | `AlphaFold parameters are not on this machine` | Nothing downloaded, or `BINDCRAFT_AF2_PARAMS` points somewhere without them. | `bindcraft fetch-weights`, or correct the variable. |
 | `checkpoints missing or unfinished` | An interrupted download, or an unpack that lost a model. | Delete `~/.cache/bindcraft/alphafold` and run `bindcraft fetch-weights` again. |
